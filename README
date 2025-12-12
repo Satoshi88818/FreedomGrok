@@ -1,1 +1,162 @@
 
+# FreedomGrok v6 — Universal Black Budget & Kleptocracy Hunter  
+**Currency-agnostic · Cryptocurrency-native · Near-zero false positives**  
+*A fully autonomous, distributed, machine-learning-powered watchdog for covert financial flows across fiat and blockchain networks.*
+
+```
+“Show me the money… even when they don’t want you to see it.”
+```
+
+### Warning
+**This tool is designed exclusively for transparency, investigative journalism, law-enforcement, and civil-society oversight.**  
+It must never be used for illegal surveillance, harassment, or vigilante activity.
+
+If you are a government agency, NGO, journalist, or researcher fighting corruption — welcome.  
+If you are not — close this repository now.
+
+---
+
+### What It Does
+
+FreedomGrok v6 continuously monitors financial transaction streams (fiat + crypto) in real time and flags patterns that are characteristic of:
+
+- Black-budget programs  
+- State-actor slush funds  
+- Kleptocratic laundering networks  
+- Sanctioned-entity financing  
+- Covert influence operations  
+- Offshore “cutout” entity chains  
+
+It combines:
+- Unsupervised autoencoder anomaly detection (PyTorch + Ray on GPU)
+- Heuristic “cutout” scoring (shell-company naming, offshore jurisdictions, privacy-coin usage, etc.)
+- Dynamic state-actor reputation tracking (Redis)
+- Custom rule engine (safe-eval expressions)
+- Honey-account trap detection
+- Friday-night / round-number / large-transfer clustering
+
+All logic is currency-agnostic and works with USD, EUR, CHF, CNY, RUB, AED, crypto (BTC, ETH, USDT, USDC, XMR, etc.), and any future currency you add.
+
+---
+
+### Architecture Overview
+
+```
+Kafka → FreedomGrok v6 → Ray/GPU Detector → Redis (state) → SMTP Alerts + Prometheus metrics
+          ↑                   ↑
+      HashiCorp Vault     FastAPI /metrics endpoint
+```
+
+- **Distributed detection** via Ray (scales to multiple GPUs/nodes)  
+- **Secrets** stored in HashiCorp Vault (Fernet + HMAC keys)  
+- **Real-time streaming** from Kafka  
+- **Alert throttling** + batching for performance  
+- **API + metrics** (/health, /stats, /metrics for Prometheus)
+
+---
+
+### Quick Start (Docker recommended)
+
+```bash
+git clone https://github.com/yourname/FreedomGrok-v6.git
+cd FreedomGrok-v6
+
+# 1. Create .env (see .env.example)
+cp .env.example .env
+
+# 2. Fill in your secrets:
+#    VAULT_URL, VAULT_TOKEN, SMTP_*, API_TOKEN, etc.
+
+# 3. Run with Docker Compose (includes Kafka, Redis, Vault dev server)
+docker-compose up --build
+
+# The hunter will start automatically in streaming mode.
+# To run only the API:  python FreedomGrokv6.txt api
+```
+
+### Manual / Development Setup
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt   # (create this from the imports)
+
+# Export environment variables or use .env + python-dotenv
+export $(cat .env | xargs)
+
+# Run the hunter
+python FreedomGrokv6.txt
+
+# Or run API only
+python FreedomGrokv6.txt api
+```
+
+---
+
+### Configuration Files
+
+| File                     | Purpose                                                                 |
+|--------------------------|-------------------------------------------------------------------------|
+| `blackbudget_rules.json` | Custom boolean expressions (safe-eval) for high-precision triggers     |
+| `cutouts.json`           | Offshore/shell-company patterns (override or extend defaults)          |
+| `honey_accounts.json`    | List of known investigator-controlled accounts/wallets (triggers alert) |
+| `.env`                   | All secrets and connection strings                                      |
+
+Example `blackbudget_rules.json` snippet:
+```json
+[
+  {
+    "name": "Sudden 50 BTC to Monero mixer on Friday night",
+    "condition": "is_crypto and currency == 'BTC' and amount >= 40 and amount <= 60 and friday_night and cutout_score > 0.7"
+  }
+]
+```
+
+---
+
+### Exposed Endpoints
+
+| Endpoint      | Method | Auth       | Description                              |
+|---------------|--------|------------|------------------------------------------|
+| `/health`     | GET    | none       | Returns `{"status":"healthy",...}`       |
+| `/stats`      | GET    | Bearer token | Processed records, signals, TPS          |
+| `/metrics`    | GET    | none       | Prometheus metrics (records, anomalies…) |
+
+---
+
+### Metrics (Prometheus)
+
+- `bb_records_processed_total`
+- `bb_anomalies_detected_total`
+- `bb_tx_per_sec`
+- `bb_health` (1 = healthy)
+
+---
+
+### License & Ethics
+
+This project is released under the **Anti-Corruption Public License (ACPL-1.0)** — you may use, modify, and redistribute it **only** for non-commercial transparency, anti-corruption, journalistic, academic, or authorized law-enforcement purposes.
+
+Commercial use, use by private intelligence firms, or use for targeted surveillance of individuals is explicitly prohibited.
+
+---
+
+### Disclaimer
+
+The author provide no warranty and accept no liability for misuse.  
+Running this software may fall under financial-monitoring laws in your jurisdiction — ensure compliance with AML/KYC reporting obligations when alerts are generated.
+
+---
+
+**For transparency. For justice. For a world where no budget stays black forever.**
+
+— The FreedomGrok Collective  
+December 2025
+
+```
+      /\
+     /  \    ___ _ __ ___   __ _ _ __ __ _
+    / /\ \  / __| '_ ` _ \ / _` | '__/ _` |
+   / ____ \ \__ \ | | | | | (_| | | | (_| |
+  /_/    \_\___/_| |_| |_|\__,_|_|  \__,_|
+```

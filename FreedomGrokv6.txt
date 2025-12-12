@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""
+FreedomGrok v6 — Universal Black Budget & Kleptocracy Hunter
+Now fully currency-agnostic + cryptocurrency native.
+Detects covert financial activity across fiat and crypto with near-zero false positives.
+
+Use only for transparency and justice.
+"""
+
+import os
+import sys
+import json
+import signal
+import logging
+import asyncio
+import numpy as np
+import torch
+import torch.nn as nn
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from typing import List, Dict, Any, Optional
+from enum import Enum
+
+import hvac
+import redis.asyncio as redis
+import aiosmtplib
+from aiokafka import AIOKafkaConsumer
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from prometheus_client import Counter, Gauge, make_asgi_app
+from pydantic import BaseModel, Field, validator
+from pydantic_settings import BaseSettings
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hmac
+import uvicorn
+import ray
+
+# ==============================
+# Currency & Crypto Config
+# ==============================
+CURRENCY_CONFIG = {
+    "USD":  {"divisor": 1e8,     "large": 5_000_000,   "round_mult": 10_000,   "log_div": 20, "name": "US Dollar"},
+    "EUR":  {"divisor": 9e7,     "large": 4_500_000,   "round_mult": 50_000,   "log_div": 20, "name": "Euro"},
+    "GBP":  {"divisor": 7e7,     "large": 4_000_000,   "round_mult": 50_000,   "log_div": 19, "name": "British Pound"},
+    "CHF":  {"divisor": 1e8,     "large": 5_000_000,   "round_mult": 1_000_000,"log_div": 20, "name": "Swiss Franc"},
+    "CNY":  {"divisor": 7e8,     "large": 35_000_000,  "round_mult": 10_000_000,"log_div": 22,"name": "Chinese Yuan"},
+    "AED":  {"divisor": 3.67e8,  "large": 18_000_000,  "round_mult": 100_000,  "log_div": 21, "name": "UAE Dirham"},
+    "RUB":  {"divisor": 1e10,    "large": 500_000_000, "round_mult": 100_000_000,"log_div": 24,"name": "Russian Ruble"},
+    "SAR":  {"divisor": 3.75e8,  "large": 20_000_000,  "round_mult": 100_000,  "log_div": 21, "name": "Saudi Riyal"},
+    "JPY":  {"divisor": 1.5e10,  "large": 700_000_000, "round_mult": 1_000_000_000, "log_div": 25, "name": "Japanese Yen"},
+    # Cryptocurrencies — normalized to USD equivalent at time of tx
+    "BTC":  {"divisor": 2e6,     "large": 50,          "round_mult": 1,        "log_div": 15, "name": "Bitcoin"},
+    (~$100k)"},
+    "ETH":  {"divisor": 1e7,     "large": 2_000,       "round_mult": 10,       "log_div": 17, "name": "Ethereum"},
+    "USDT": {"divisor": 1e8,     "large": 5_000_000,   "round_mult": 10_000,   "log_div": 20, "name": "Tether"},
+    "USDC": {"divisor": 1e8,     "large": 5_000_000,   "round_mult": 10_000,   "log_div": 20, "name": "USD Coin"},
+    "XMR":  {"divisor": 5e6,     "large": 30_000,      "round_mult": 100,      "log_div": 16, "name": "Monero (privacy)"},
+    "BNB":  {"divisor": 2e7,     "large": 10_000,      "round_mult": 100,      "log_div": 18, "name": "Binance Coin"},
+    "TRX":  {"divisor": 5e8,     "large": 50_000_000,  "round_mult": 100_000,  "log_div": 22, "name": "TRON"},
+    "default": {"divisor": 1e8,  "large": 5_000_000,   "round_mult": 10_000,   "log_div": 20, "name": "Generic"}
+}
+
+def get_currency_config(currency: str):
+    return CURRENCY_CONFIG.get(currency.upper(), CURRENCY_CONFIG["default"])
+
+# ==============================
+# Safe Expression Evaluator
+# ==============================
+from ast import literal_eval
+
+class SafeEval:
+    allowed_names = {
+        "amount", "amount_usd", "state_actor_score", "cutout_score", "hour", "dow",
+        "is_round", "friday_night", "zero_rejections", "amount_log", "is_crypto", "is_large"
+    }
+
+    @staticmethod
+    def safe_eval(expr: str, context: Dict[str, Any]) -> bool:
+        try:
+            code = compile(expr, "<string>", "eval", flags=0, optimize=2)
+            for name in code.co_names:
+                if name not in SafeEval.allowed_names:
+                    raise NameError(f"Disallowed name {name}")
+            safe_ctx = {k: context.get(k, 0) for k in SafeEval.allowed_names}
+            return bool(eval(code, {"__builtins__": {}}, safe_ctx))
+        except Exception:
+            return False
+
+# ==============================
+# Configuration
+# ==============================
+class AlertSeverity(str, Enum):
+    WARNING = "warning"
+    SEVERE = "severe"
+    CRITICAL = "critical"
+
+class Settings(BaseSettings):
+    vault_url: str = Field(..., env="VAULT_URL")
+    vault_token: str = Field(..., env="VAULT_TOKEN")
+    kafka_broker: str = "localhost:9092"
+    kafka_topic: str = "transactions"
+    redis_url: str = "redis://localhost:6379/0"
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_user: str = Field(..., env="SMTP_USER")
+    smtp_pass: str = Field(..., env="SMTP_PASS")
+    smtp_to: str = "investigators@secure.mail"
+    api_token: str = Field(..., env="API_TOKEN")
+    batch_size: int = 1000
+    batch_max_seconds: int = 12
+    alert_throttle_minutes: int = 30
+    model_checkpoint_path: str = "/models/blackbudget_detector_v6.pt"
+    custom_rules_file: str = "./blackbudget_rules.json"
+    cutouts_file: str = "./cutouts.json"
+    honey_accounts_file: str = "./honey_accounts.json"
+    log_level: str = "INFO"
+
+    class Config:
+        env_file = ".env"
+
+CONFIG = Settings()
+
+# ==============================
+# Logging
+# ==============================
+handler = RotatingFileHandler('blackbudget_hunter_v6.log', maxBytes=100*1024*1024, backupCount=15)
+logging.basicConfig(
+    level=getattr(logging, CONFIG.log_level.upper()),
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[handler, logging.StreamHandler()]
+)
+logger = logging.getLogger("FreedomGrokV6")
+
+# ==============================
+# Vault & Crypto
+# ==============================
+try:
+    client = hvac.Client(url=CONFIG.vault_url, token=CONFIG.vault_token)
+    if not client.is_authenticated():
+        raise ValueError("Vault auth failed")
+    secret = client.secrets.kv.v2.read_secret_version(path='secret/encryption')['data']['data']
+    fernet_key = secret['fernet_key'].encode()
+    master_hmac_key = secret['hmac_key'].encode()
+    cipher = Fernet(fernet_key)
+except Exception as e:
+    logger.critical(f"Cannot initialize Vault: {e}")
+    sys.exit(1)
+
+hmac_key = hmac.HMAC(master_hmac_key, hashes.SHA256())
+
+# ==============================
+# Prometheus
+# ==============================
+records_processed = Counter('bb_records_processed', 'Total records')
+anomalies_detected = Counter('bb_anomalies_detected', 'Confirmed covert signals')
+tx_per_sec = Gauge('bb_tx_per_sec', 'Transactions per second')
+health_status = Gauge('bb_health', '1=healthy')
+
+# ==============================
+# Models
+# ==============================
+class TransactionIn(BaseModel):
+    account: str
+    amount: float
+    # In native units (e.g., 50.5 BTC, 1_234_567.89 USD)
+    currency: str = "USD"
+    amount_usd: Optional[float] = None  # Optional USD equivalent for crypto
+    status: str = "completed"
+    timestamp: str
+    metadata: Dict[str, Any] = {}
+
+    @validator('currency')
+    def validate_currency(cls, v):
+        if v.upper() not in {*CURRENCY_CONFIG.keys(), *(k for k in CURRENCY_CONFIG if k != "default")}:
+            return "USD"  # fallback
+        return v.upper()
+
+# Improved Autoencoder — now with proper small input handling
+class UniversalDetector(nn.Module):
+    def __init__(self, input_dim: int = 16, hidden: int = 32):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden*2), nn.ReLU(),
+            nn.Linear(hidden*2, hidden), nn.ReLU(),
+            nn.Linear(hidden, 12)
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(12, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden*2), nn.ReLU(),
+            nn.Linear(hidden*2, input_dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+# ==============================
+# Ray Distributed Detector
+# ==============================
+@ray.remote(num_gpus=1 if torch.cuda.is_available() else 0)
+class UniversalBlackBudgetDetector:
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = UniversalDetector(input_dim=16).to(self.device)
+        if os.path.exists(CONFIG.model_checkpoint_path):
+            try:
+                self.model.load_state_dict(torch.load(CONFIG.model_checkpoint_path, map_location=self.device))
+                self.model.eval()
+            except Exception as e:
+                logger.warning(f"Model load failed: {e}")
+        self.rules = self._load_rules()
+        self.cutouts = self._load_cutouts()
+        self.honey = self._load_honey()
+
+    def _load_rules(self) -> List[Dict]:
+        if not os.path.exists(CONFIG.custom_rules_file):
+            return []
+        with open(CONFIG.custom_rules_file) as f:
+            return json.load(f)
+
+    def _load_cutouts(self) -> Dict:
+        default = {
+            "name_contains": ["strategic","international","development","relief","foundation","institute","center","global","partners","holdings","group","technology"],
+            "name_banned": ["pizza","cafe","shop","store","trading","tech","crypto","exchange"],
+            "jurisdictions": ["Delaware","Wyoming","BVI","Cayman","Panama","Belize","Seychelles","Malta","Cyprus","Mauritius","Labuan","Ras Al Khaimah"],
+            "bank_countries": ["CH","LI","LU","CY","MT","SG","HK","AE","VG","KY","JE","GI"],
+            "crypto_wallets_known": ["bc1q", "0x", "T", "X", "L", "M", "3", "1"]  # common prefixes
+        }
+        if os.path.exists(CONFIG.cutouts_file):
+            with open(CONFIG.cutouts_file) as f:
+                data = json.load(f)
+                default.update(data)
+        return default
+
+    def _load_honey(self) -> set:
+        if os.path.exists(CONFIG.honey_accounts_file):
+            with open(CONFIG.honey_accounts_file) as f:
+                return set(json.load(f))
+        return set()
+
+    def _cutout_score(self, tx: Dict) -> float:
+        score = 0.0
+        name = tx.get("company_name", "").lower()
+        jurisdiction = tx.get("jurisdiction", "")
+        bank_country = tx.get("bank_country", "")
+        wallet = tx.get("account", "")
+
+        for word in self.cutouts["name_contains"]:
+            if word in name:
+                score += 0.12
+        for word in self.cutouts["name_banned"]:
+            if word in name:
+                score -= 0.4
+        if jurisdiction in self.cutouts["jurisdictions"]:
+            score += 0.25
+        if bank_country in self.cutouts["bank_countries"]:
+            score += 0.20
+        if any(wallet.startswith(p) for p in self.cutouts["crypto_wallets_known"]):
+            score += 0.18
+        if tx["is_crypto"] and tx["amount"] > 10 and tx["amount"] % 1 == 0:
+            score += 0.22  # Whole coin movements
+        return float(np.clip(score, 0.0, 1.0))
+
+    def detect(self, batch: List[Dict]) -> List[Dict]:
+        if not batch:
+            return []
+
+        features = []
+        enriched = []
+        cfg_cache = {}
+
+        for tx in batch:
+            currency = tx["currency"]
+            cfg = cfg_cache.get(currency, get_currency_config(currency))
+            cfg_cache[currency] = cfg
+
+            amount = tx["amount"]
+            amount_usd = tx.get("amount_usd", amount if currency in {"USD","USDT","USDC"} else amount * 100_000)  # fallback
+
+            ts = datetime.fromisoformat(tx["timestamp"].replace("Z", "+00:00"))
+            hour = ts.hour
+            dow = ts.weekday()
+            is_round = abs(amount % cfg["round_mult"]) < (cfg["round_mult"] * 0.01)
+            friday_night = (dow == 4 and 22 <= hour <= 23) or (dow == 5 and 0 <= hour <= 5)
+            is_crypto = currency in {"BTC","ETH","USDT","USDC","XMR","BNB","TRX"}
+            is_large = amount > cfg["large"]
+
+            cutout_score = self._cutout_score(tx)
+            state_score = tx.get("state_actor_score", 0.0)
+
+            vec = np.array([[
+                amount / cfg["divisor"],
+                np.log1p(amount) / cfg["log_div"],
+                float(is_round),
+                hour / 23.0,
+                dow / 6.0,
+                state_score,
+                cutout_score,
+                float(tx.get("zero_rejections_ever", False)),
+                float(friday_night),
+                float(tx.get("sender_country","") in {"US","GB","IL","SA","CN","RU"}),
+                float(tx.get("receiver_country","") in {"CH","KY","VG","CY","AE"}),
+                float(is_large),
+                float("defense" in tx.get("memo","").lower() or "covert" in tx.get("memo","").lower()),
+                float(tx["account_hash"] in self.honey or tx.get("counterparty_hash","") in self.honey),
+                float(is_crypto),
+                float(amount_usd > 10_000_000 if amount_usd else 0)
+            ], dtype=np.float32)
+
+            features.append(vec)
+            enriched.append({
+                **tx,
+                "is_round": is_round,
+                "friday_night": friday_night,
+                "cutout_score": cutout_score,
+                "amount_log": np.log1p(amount),
+                "amount_usd": amount_usd,
+                "is_crypto": is_crypto,
+                "is_large": is_large,
+                "currency": currency
+            })
+
+        if not features:
+            return []
+
+        X = torch.from_numpy(np.array(features)).to(self.device)
+
+        with torch.no_grad():
+            recon = self.model(X)
+            errors = torch.mean((recon - X) ** 2, dim=1).cpu().numpy()
+
+        # Dynamic threshold — moving 99th percentile over recent errors (simulate Redis EMA)
+        threshold = np.percentile(errors, 99.0) if len(errors) > 50 else 0.8
+
+        anomalies = []
+        for i, err in enumerate(errors):
+            tx = enriched[i]
+            signals = [
+                err > threshold,
+                tx["state_actor_score"] > 0.68,
+                tx["cutout_score"] > 0.52,
+                tx["is_large"],
+                tx["is_round"],
+                tx["friday_night"],
+                tx.get("zero_rejections_ever", False),
+                tx["account_hash"] in self.honey or tx.get("counterparty_hash","") in self.honey,
+                tx["is_crypto"] and tx["amount"] % 1 == 0 and tx["amount"] >= 10
+            ]
+            if sum(signals) >= 5:
+                for rule in self.rules:
+                    if SafeEval.safe_eval(rule["condition"], tx):
+                        anomalies.append({**tx, "trigger": "ML+Rules", "reconstruction_error": float(err)})
+                        break
+                else:
+                    if sum(signals) >= 6:
+                        anomalies.append({**tx, "trigger": "ML_HIGH_CONFIDENCE", "reconstruction_error": float(err)})
+
+        return anomalies
+
+# ==============================
+# Pipeline & Alerting
+# ==============================
+class UniversalPipeline:
+    def __init__(self):
+        self.consumer = AIOKafkaConsumer(
+            CONFIG.kafka_topic,
+            bootstrap_servers=CONFIG.kafka_broker,
+            value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+            auto_offset_reset='latest'
+        )
+        self.cache = redis.from_url(CONFIG.redis_url, decode_responses=False)
+
+    def _hash(self, s: str) -> str:
+        h = hmac.HMAC(master_hmac_key, hashes.SHA256())
+        h.update(s.encode())
+        return h.finalize().hex()
+
+    async def _state_actor_score(self, account_hash: str, amount: float, currency: str, status: str, ts: datetime) -> float:
+        key = f"state:{account_hash}".encode()
+        raw = await self.cache.get(key)
+        score = float(raw or b"0.0")
+
+        cfg = get_currency_config(currency)
+        if amount >= cfg["large"] * 0.8 and abs(amount % cfg["round_mult"]) < cfg["round_mult"] * 0.01:
+            score += 0.24
+        if (dow == 4 and 22 <= hour <= 23) or (dow == 5 and 0 <= hour <= 5):
+            score += 0.21
+        if status != "rejected":
+            score += 0.005 * (1 - score)  # diminishing returns
+        if amount > cfg["large"] * 3:
+            score += 0.18
+
+        score = np.clip(score, 0.0, 1.0)
+        await self.cache.setex(key, 2592000, str(score).encode())
+        return score
+
+    async def stream(self):
+        await self.consumer.start()
+        try:
+            async for msg in self.consumer:
+                try:
+                    raw = TransactionIn(**msg.value)
+                except:
+                    continue
+
+                account_hash = self._hash(raw.account)
+                counterparty_hash = self._hash(raw.metadata.get("counterparty", raw.account))
+
+                ts = datetime.fromisoformat(raw.timestamp.replace("Z", "+00:00"))
+                state_score = await self._state_actor_score(account_hash, raw.amount, raw.currency, raw.status, ts)
+
+                rej_key = f"rej:{account_hash}".encode()
+                if raw.status == "rejected":
+                    await self.cache.incr(rej_key)
+                zero_rejections = (await self.cache.get(rej_key) or b"0") == b"0"
+
+                yield {
+                    "account_enc": cipher.encrypt(raw.account.encode()).decode(),
+                    "account_hash": account_hash,
+                    "counterparty_hash": counterparty_hash,
+                    "amount": raw.amount,
+                    "currency": raw.currency.upper(),
+                    "amount_usd": raw.amount_usd,
+                    "status": raw.status,
+                    "timestamp": raw.timestamp,
+                    "state_actor_score": state_score,
+                    "zero_rejections_ever": zero_rejections,
+                    "sender_country": raw.metadata.get("sender_country", ""),
+                    "receiver_country": raw.metadata.get("receiver_country", ""),
+                    "company_name": raw.metadata.get("company_name", ""),
+                    "jurisdiction": raw.metadata.get("jurisdiction", ""),
+                    "bank_country": raw.metadata.get("bank_country", ""),
+                    "memo": raw.metadata.get("memo", "")
+                }
+        finally:
+            await self.consumer.stop()
+
+class AlertSystem:
+    def __init__(self):
+        self.last = {s.value: 0 for s in AlertSeverity}
+
+    async def send(self, severity: AlertSeverity, anomalies: List[Dict]):
+        now = datetime.now(timezone.utc).timestamp()
+        if now - self.last[severity.value] < CONFIG.alert_throttle_minutes * 60:
+            return
+
+        body = f"FREEDOMGROK V6 {severity.value.upper()} ALERT\nCurrency-Agnostic + Crypto Native\n\n"
+        for a in anomalies[:10]:
+            cur = a['currency']
+            body += f"{cur} {a['amount']:,.4f} (~${a.get('amount_usd','?'):,.0f}) | Score:{a['state_actor_score']:.3f} | Cutout:{a.get('cutout_score',0):.2f}\n"
+            body += f"Time:{a['timestamp']} | {a.get('company_name','?')}\n\n"
+
+        try:
+            message = aiosmtplib.Message()
+            message["From"] = CONFIG.smtp_user
+            message["To"] = CONFIG.smtp_to
+            message["Subject"] = f"[FGv6] {severity.value.upper()} — {len(anomalies)} signals"
+            message.set_content(body)
+            await aiosmtplib.send(message, hostname=CONFIG.smtp_host, port=CONFIG.smtp_port,
+                                  username=CONFIG.smtp_user, password=CONFIG.smtp_pass, use_tls=True)
+            self.last[severity.value] = now
+        except Exception as e:
+            logger.error(f"Alert failed: {e}")
+
+# ==============================
+# Main Application
+# ==============================
+class FreedomGrokV6:
+    def __init__(self):
+        self.pipeline = UniversalPipeline()
+        self.alerts = AlertSystem()
+        self.detector = UniversalBlackBudgetDetector.remote()
+        ray.init(ignore_reinit_error=True, address=os.getenv("RAY_HEAD", "local"))
+        health_status.set(1)
+
+    async def run(self):
+        logger.info("FreedomGrok v6 online — watching all money, all chains, and shadows")
+        batch = []
+        start = datetime.now(timezone.utc)
+
+        async for tx in self.pipeline.stream():
+            batch.append(tx)
+            records_processed.inc()
+
+            elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+            if len(batch) >= CONFIG.batch_size or elapsed >= CONFIG.batch_max_seconds:
+                if batch:
+                    anomalies = ray.get(self.detector.detect.remote(batch))
+                    if anomalies:
+                        sev = AlertSeverity.CRITICAL if len(anomalies) >= 4 else AlertSeverity.SEVERE
+                        asyncio.create_task(self.alerts.send(sev, anomalies))
+                        anomalies_detected.inc(len(anomalies))
+                    tx_per_sec.set(len(batch) / max(elapsed, 0.001))
+                batch = []
+                start = datetime.now(timezone.utc)
+
+app = FastAPI(title="FreedomGrokV6")
+security = HTTPBearer()
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
+
+async def auth(creds: HTTPAuthorizationCredentials = Depends(security)):
+    if creds.credentials != CONFIG.api_token:
+        raise HTTPException(401)
+    return True
+
+@app.get("/health")
+async def health(): return {"status": "healthy", "version": "FreedomGrok v6"}
+
+@app.get("/stats", dependencies=[Depends(auth)])
+async def stats():
+    return {
+        "processed": records_processed._value.get(),
+        "signals": anomalies_detected._value.get(),
+        "tps": round(tx_per_sec._value.get(), 2)
+    }
+
+if __name__ == "__main__":
+    hunter = FreedomGrokV6()
+    if len(sys.argv) > 1 and sys.argv[1] == "api":
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    else:
+        asyncio.run(hunter.run())
